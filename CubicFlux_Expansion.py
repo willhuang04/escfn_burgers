@@ -1,15 +1,15 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
-n_instances = 200
-n_t = 20
+n_instances = 1
+n_t = 600
 n_x = 256
 
-uL = np.random.uniform(0.8, 1.2, size=(n_instances, 1, 1))
-uR = np.random.uniform(-0.2, 0.2, size=(n_instances, 1, 1))
+uR = np.random.uniform(0.8, 1.2, size=(n_instances, 1, 1))
+uL = np.random.uniform(-0.2, 0.2, size=(n_instances, 1, 1))
 
 xs = np.linspace(-5,5,n_x)
-ts = np.linspace(0,0.1,n_t+1)
+ts = np.linspace(0,0.005*n_t,n_t+1)
 
 X, T = np.meshgrid(xs, ts)
 
@@ -34,4 +34,4 @@ Z = np.expand_dims(Z, axis=-1)
 
 print(np.shape(Z))
 
-np.save('trainData_CubicFlux_Expansion_256.npy', Z)
+np.save('testData_CubicFlux_Expansion_256.npy', Z)
