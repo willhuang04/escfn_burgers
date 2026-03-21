@@ -2,6 +2,7 @@
 
 import time
 import os
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 import argparse
 import matplotlib
 from absl import logging
@@ -24,11 +25,7 @@ from jax.sharding import Mesh, PartitionSpec
 from etils import epath
 import matplotlib.pyplot as plt
 
-# 1. Fix the Gdk Display Error (forces matplotlib to run without a screen)
 matplotlib.use('Agg')
-
-# 2. Fix the CuDNN / GPU Memory Error
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 import pdb
 
@@ -97,8 +94,8 @@ class FluxSpectral(nn.Module):
         fluxes_x = fluxes[:, :3]
         fluxes_y = fluxes[:, 3:]
 
-        jac_x = jax.vmap(jax.jacrev(lambda u: self.forward_flux(u)[:3]))(u_flat)
-        jac_y = jax.vmap(jax.jacrev(lambda u: self.forward_flux(u)[3:]))(u_flat)
+        jac_x = jax.vmap(jax.jacfwd(lambda u: self.forward_flux(u)[:3]))(u_flat)
+        jac_y = jax.vmap(jax.jacfwd(lambda u: self.forward_flux(u)[3:]))(u_flat)
         
         jac_x_flat = jac_x.reshape(jac_x.shape[0], -1)
         jac_y_flat = jac_y.reshape(jac_y.shape[0], -1)
@@ -223,6 +220,7 @@ def apply_model(state, un, u_np1):
         
         model_apply = state.apply_fn
         
+        @jax.remat
         def step_fn(carry_state, target_step):
             um = carry_state
             u = model_apply(params, um)
@@ -263,32 +261,31 @@ def apply_model_val(state, un, u_np1):
 def update_model(state, grads):
     return state.apply_gradients(grads=grads)
 
-
+@partial(jax.jit, static_argnames=['batch_size'])
 def train_epoch(state, train_ds, val_ds, batch_size, rng):
     """Train for a single epoch."""
-    train_ds_size = len(train_ds['un'])
+    train_ds_size = train_ds['un'].shape[0]
     steps_per_epoch = train_ds_size // batch_size
     perms = jax.random.permutation(rng, len(train_ds['un']))
     perms = perms[: steps_per_epoch * batch_size]  # skip incomplete batch
     perms = perms.reshape((steps_per_epoch, batch_size))
     
-    epoch_loss = []
-    count = 0
-    for perm in perms:
+    def step_fn(current_state, perm):
         batch_input = train_ds['un'][perm, ...]
         batch_output = train_ds['un_p1'][perm, ...]
-        grads, loss = apply_model(state, batch_input, batch_output)
-        # jax.debug.print("No. Steps {step}, Loss {l}", step = count, l=loss)
-        count += 1
-        state = update_model(state, grads)
-        epoch_loss.append(float(loss))
-    train_loss = np.mean(epoch_loss)
+        grads, loss = apply_model(current_state, batch_input, batch_output)
+        next_state = update_model(current_state, grads)
+        
+        return next_state, loss 
+
+    final_state, epoch_loss = jax.lax.scan(step_fn, state, perms)
+    train_loss = jnp.mean(epoch_loss)
     # Validate
-    val_loss = apply_model_val(state, val_ds['un'], val_ds['un_p1'])
-    return state, train_loss, val_loss
+    val_loss = apply_model_val(final_state, val_ds['un'], val_ds['un_p1'])
+    return final_state, train_loss, val_loss
 
 
-def get_Datasets(Noise_level,rng=None, L = 10, data_path = 'Data/trainData.npy'):
+def get_Datasets(IC_Noise_level, Noise_level, rng=None, L = 10, data_path = 'Data/trainData.npy'):
     """Load Dataset"""
     if rng is None:
         rng = jax.random.PRNGKey(100)
@@ -303,9 +300,13 @@ def get_Datasets(Noise_level,rng=None, L = 10, data_path = 'Data/trainData.npy')
         un_p1.append(trainData[i:i+1, index+1:index+L+1,:,:,:]) 
     un = np.concatenate(un, axis=0)
     un_p1 = np.concatenate(un_p1, axis=0)
+    axis_to_average = tuple(range(trainData.ndim - 1)) 
+    dataset_mean_abs = np.mean(np.abs(trainData), axis=axis_to_average, keepdims=True)
+    dataset_mean_abs = np.squeeze(dataset_mean_abs)
     rng1, rng = jax.random.split(rng)
+    un += jax.random.normal(rng, shape=un.shape) * dataset_mean_abs * IC_Noise_level
     shape = un_p1.shape
-    un_p1 += jax.random.normal(rng1, shape=shape) * np.mean(np.abs(trainData)) * Noise_level
+    un_p1 += jax.random.normal(rng1, shape=shape) * dataset_mean_abs * Noise_level
     train_ds['un'] = un # un.reshape(-1, un.shape[2],1)
     train_ds['un_p1'] = un_p1 # un_p1.reshape(-1, un_p1.shape[2], 1)
     return train_ds  
@@ -321,7 +322,7 @@ def create_train_state(ess, rng, learning_rate):
     return train_state.TrainState.create(apply_fn=ess.TVD_RK3, params=params, tx=tx)
 
 
-def TrainEntropyStableScheme(nx, ny, dt, epochs, batch_size, lr, noise, timesteps, resume_training, ckpt_dir='./ckpts/Edge/'):
+def TrainEntropyStableScheme(nx, ny, dt, epochs, batch_size, lr, ic_noise, noise, timesteps, resume_training, ckpt_dir='./ckpts/Edge/'):
     
     Nx = nx
     Ny = ny
@@ -337,14 +338,15 @@ def TrainEntropyStableScheme(nx, ny, dt, epochs, batch_size, lr, noise, timestep
     rng, gendata_rng = jax.random.split(rng)
     timeSteps = timesteps
     Noise_level = noise
-    train_ds = get_Datasets(Noise_level, L=timeSteps, rng = gendata_rng, data_path = 'Data/trainData_2D_shallow_water_'+str(Nx)+'.npy')
+    IC_Noise_level = ic_noise
+    train_ds = get_Datasets(IC_Noise_level, Noise_level, L=timeSteps, rng = gendata_rng, data_path = 'Data/trainData_2D_shallow_water_'+str(Nx)+'.npy')
     rng, gendata_rng = jax.random.split(rng)
-    val_ds = get_Datasets(Noise_level, L=timeSteps, rng = gendata_rng, data_path = 'Data/valData_2D_shallow_water_' + str(Nx) + '.npy')
+    val_ds = get_Datasets(IC_Noise_level, Noise_level, L=timeSteps, rng = gendata_rng, data_path = 'Data/valData_2D_shallow_water_' + str(Nx) + '.npy')
     #schedule = optax.piecewise_constant_schedule(lr, boundaries_and_scales={4000:0.3, 10000:0.1})
                                                  #{2000:1/2, 4000:1/2, 8000:1/2, 10000:1/2,15000:1/2})  
     # schedule = optax.exponential_decay(lr, 2000, 0.95, end_value=1e-6)
     total_steps = (len(train_ds['un']) // batch_size) * epochs
-    schedule = optax.cosine_decay_schedule(init_value=lr, decay_steps=total_steps, alpha=1e-3)
+    schedule = optax.cosine_decay_schedule(init_value=lr, decay_steps=total_steps, alpha=1)
     rng, init_rng = jax.random.split(rng)
     state = create_train_state(EntropyStableForm, init_rng, schedule)
     #orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
@@ -456,18 +458,31 @@ def evaluateESS(nx, ny, dt, eval_steps, ckpt_dir='ckpts/Edge/'):
     y_end = 1
     t = np.linspace(0.0, N * dt, N + 1)
     
-    un = testData[:1,0,:,:,:]
-    un_p1 = testData[:1,:,:,:,:]
+    un = testData[:, 0, :, :, :]
+    un_p1 = testData[:, :, :, :, :]
     
-    def step_fn(current_u, _):
-        next_u = state.apply_fn(state.params, current_u)
-        return next_u, next_u
+    @jax.jit
+    def rollout(start_state):
+        def step_fn(current_u, _):
+            next_u = state.apply_fn(state.params, current_u)
+            return next_u, next_u
+        _, u_pred_steps = jax.lax.scan(step_fn, start_state, xs=None, length=N)
+        return u_pred_steps
     
-    _, u_pred_steps = jax.lax.scan(step_fn, un, xs=None, length=N)
-    
+    u_pred_steps = rollout(un)
     un_expanded = jnp.expand_dims(un, axis=0) 
     u_pred_stacked = jnp.concatenate([un_expanded, u_pred_steps], axis=0)
-    u_pred = jnp.swapaxes(jnp.array(u_pred_stacked), 0, 1)
+    u_pred = jnp.swapaxes(u_pred_stacked, 0, 1)
+    
+    no_traj = testData.shape[0]
+    avg_error = 0
+    for i in range(no_traj):
+        exact_state = testData[i, N, :, :, 0]
+        pred_state = u_pred[i, N, :, :, 0]
+        l2_diff = np.linalg.norm(exact_state - pred_state)
+        l2_exact = np.linalg.norm(exact_state) + 1e-8
+        avg_error += (l2_diff / l2_exact) / no_traj
+    print(f'Average test error: {avg_error:.6f}')
     
     # Snapshot plot at final time.
     pred = u_pred[0, N, :, :, 0]
@@ -599,17 +614,18 @@ if __name__=="__main__":
 
     parser.add_argument("--mode", choices=["train", "check", "eval"], default="train")
     parser.add_argument("--resume", action="store_true", help="Flag to resume from the latest checkpoint")
-    parser.add_argument("--nx", type=int, default=64)
-    parser.add_argument("--ny", type=int, default=64)
-    parser.add_argument("--dt", type=float, default=0.0025)
+    parser.add_argument("--nx", type=int, default=256)
+    parser.add_argument("--ny", type=int, default=256)
+    parser.add_argument("--dt", type=float, default=0.000625)
     parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--epochs", type=int, default=300)
-    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--lr", type=float, default=5e-3)
+    parser.add_argument("--ic_noise", type=float, default=0.0)
     parser.add_argument("--noise", type=float, default=0.0)
     parser.add_argument("--steps", type=int, default=10)
-    parser.add_argument("--eval_nx", type=int, default=64)
-    parser.add_argument("--eval_ny", type=int, default=64)
-    parser.add_argument("--eval_dt", type=float, default=0.0025)
+    parser.add_argument("--eval_nx", type=int, default=256)
+    parser.add_argument("--eval_ny", type=int, default=256)
+    parser.add_argument("--eval_dt", type=float, default=0.000625)
     parser.add_argument("--eval_steps", type=int, default=20)
     
     args = parser.parse_args()
@@ -620,7 +636,7 @@ if __name__=="__main__":
     my_folder = './ckpts/KT_DNN_train' + str(args.nx) + '_test' + str(args.eval_nx) + '/'
     
     if args.mode == "train":
-        TrainEntropyStableScheme(args.nx, args.ny, args.dt, args.epochs, args.batch_size, args.lr, args.noise, args.steps, args.resume, ckpt_dir=my_folder)
+        TrainEntropyStableScheme(args.nx, args.ny, args.dt, args.epochs, args.batch_size, args.lr, args.ic_noise, args.noise, args.steps, args.resume, ckpt_dir=my_folder)
     
     if args.mode in ["train", "eval", "check"]:
         evaluateESS(args.eval_nx, args.eval_ny, args.eval_dt, args.eval_steps, ckpt_dir=my_folder)
