@@ -57,21 +57,37 @@ class Flux(nn.Module):
         for i, lyr in enumerate(self.layers[:-1]):
             x = self.act(lyr(x))
         x = self.layers[-1](x)
-        return x     
+        return x  
+       
+class BoundaryNet(nn.Module):
+    Features: Sequence[int]
+    act: Callable
 
+    def setup(self):
+        self.layers = [nn.Dense(feat) for feat in self.Features]
+
+    def __call__(self, x):
+        """
+        x shape: (batch, input_dim)
+        output shape: (batch, 4)
+        """
+        for i, lyr in enumerate(self.layers[:-1]):
+            x = self.act(lyr(x))
+        x = self.layers[-1](x)
+        return x 
 
 # 4. Different Schemes
 class KurganovTadmorScheme(nn.Module):
 
-    def __init__(self,rng = jax.random.PRNGKey(0), Features=[10,1], dt=0.001, dx=0.001, boundary="fixed", limiter="minmod", bcs=[0,1]):
+    def __init__(self,rng = jax.random.PRNGKey(0), Features=[10,1],BoundaryFeatures=[10, 10, 4], dt=0.001, dx=0.001, boundary="neural", limiter="minmod"):
 
         self.Num_flux = Flux(Features, nn.silu)
+        self.Boundary_net = BoundaryNet(BoundaryFeatures, nn.silu)
         self.dt = dt
         self.dx = dx
         self.boundary = boundary.lower()
         self.limiter = limiter.lower() 
         self.rng = rng
-        self.bcs = bcs
     
     @partial(jax.jit, static_argnums=(0,))
     def flux(self, up, params):
@@ -82,7 +98,31 @@ class KurganovTadmorScheme(nn.Module):
         #d_flux = jax.jit(lambda up, params: (self.flux.apply(params, up + eps) - self.flux.apply(params, up - eps))/(2*eps))
         d_flux = jax.jit(jax.grad(lambda x, params: jnp.sum(self.Num_flux.apply(params,x))))
         return flux({'params': params['flux']},up), d_flux(up, {'params': params['flux']})        
-        
+
+    @partial(jax.jit, static_argnums=(0,))
+    def predict_ghost_cells(self, u, params):
+        """
+        u shape: (batch, Nx, 1)
+
+        Returns:
+            left_ghosts:  (batch, 2, 1)
+            right_ghosts: (batch, 2, 1)
+        """
+        left_feats = u[:, 0:3, 0]      # (batch, 3)
+        right_feats = u[:, -3:, 0]     # (batch, 3)
+
+        boundary_input = jnp.concatenate([left_feats, right_feats], axis=1)  # (batch, 6)
+
+        ghost_pred = self.Boundary_net.apply(
+            {'params': params['boundary']},
+            boundary_input
+        )  # (batch, 4)
+
+        left_ghosts = ghost_pred[:, 0:2][:, :, None]    # (batch, 2, 1)
+        right_ghosts = ghost_pred[:, 2:4][:, :, None]   # (batch, 2, 1)
+
+        return left_ghosts, right_ghosts  
+
     @partial(jax.jit, static_argnums=(0,))
     def Kurganov_Tadmor(self, u, params):
         
@@ -118,9 +158,10 @@ class KurganovTadmorScheme(nn.Module):
         if self.boundary == "same":
             up = jnp.pad(u, ((0,0),(2,2),(0,0)),mode="wrap")
         if self.boundary == "fixed":
-            up1 = jnp.pad(u ,((0,0),(2,0),(0,0)), mode="constant", constant_values=((0,0),(0,0),(0,0)))
-            up = jnp.pad(up1 ,((0,0),(0,2),(0,0)), mode="edge")
-
+            up = jnp.pad(u ,((0,0),(2,2),(0,0)), mode="constant", constant_values=((0,0),(self.bcs[0], self.bcs[1]),(0,0)))
+        if self.boundary == "neural":
+            left_ghosts, right_ghosts = self.predict_ghost_cells(u, params)
+            up = jnp.concatenate([left_ghosts, u, right_ghosts], axis=1)
 
         return self.Kurganov_Tadmor(up, params)
               
@@ -237,7 +278,8 @@ def create_train_state(ess, rng, learning_rate):
     """Creates initial `TrainState`."""
     rng1, rng2 = jax.random.split(rng)
     params1 = ess.Num_flux.init(rng1, jnp.ones([3, 1]))['params']
-    params = {'flux': params1}
+    params_boundary = ess.Boundary_net.init(rng2, jnp.ones([1, 6]))['params']
+    params = {'flux': params1, 'boundary':params_boundary}
     tx = optax.adam(learning_rate)
     return train_state.TrainState.create(apply_fn=ess.TVD_RK3, params=params, tx=tx)
 
@@ -252,7 +294,7 @@ def TrainEntropyStableScheme(epochs, lr = 1e-4,ckpt_dir='./ckpts/Edge/'):
     threshold = 1e-4
     rng = jax.random.PRNGKey(0)
     vector_rng, rng = jax.random.split(rng)
-    EntropyStableForm = KurganovTadmorScheme(rng = vector_rng, Features=[64, 64,64,64,64, 1], dt=dt, dx=dx, boundary="fixed", limiter="minmod", bcs= [0,1])
+    EntropyStableForm = KurganovTadmorScheme(rng = vector_rng, Features=[64, 64,64,64,64, 1], BoundaryFeatures=[32,32,4],dt=dt, dx=dx, boundary="neural", limiter="minmod")
     
     rng, gendata_rng = jax.random.split(rng)
     timeSteps = 20 
@@ -333,7 +375,7 @@ def evaluateESS(epochs,data_path, ckpt_dir='ckpts/Edge/'):
 
     rng = jax.random.PRNGKey(100)
     vector_rng, rng = jax.random.split(rng)    
-    EntropyStableForm = KurganovTadmorScheme(rng = vector_rng, Features=[64, 64,64,64,64, 1], dt=dt, dx=dx, boundary="fixed", limiter="minmod", bcs=[0,1])
+    EntropyStableForm = KurganovTadmorScheme(rng = vector_rng, Features=[64, 64,64,64,64, 1],BoundaryFeatures=[32,32,4], dt=dt, dx=dx, boundary="neural", limiter="minmod",)
     rng, init_rng = jax.random.split(rng)
     state = create_train_state(EntropyStableForm, init_rng, lr)    
     options = ocp.CheckpointManagerOptions(
@@ -367,7 +409,7 @@ def evaluateESS(epochs,data_path, ckpt_dir='ckpts/Edge/'):
     if not os.path.exists('_plots/' + dir_path[1] + '/Conserved_u'):
         os.mkdir('_plots/' + dir_path[1] + '/Conserved_u') 
     
-    # data_path =  'Data/report/periodic/testData_periodic_sin_Burgers_'+str(Nx) +'_Low.npy'
+    #data_path =  'Data/report/fixed_dirichlet/testData_dirichlet_positive_sin_Burgers_'+str(Nx) +'_Low.npy'
     testData = np.load(data_path)
 
     
@@ -459,7 +501,6 @@ if __name__=="__main__":
     #path = os.path.abspath(".")
     #print(path)
     
-    #TrainEntropyStableScheme(50, ckpt_dir= 'ckpts/report/dirichlet_train_sq_sin_correct/')#KT_superbee_trainableSPNorm_silu_NoNoise_L15_512/')
-    evaluateESS(50, 'Data/report/dirichlet/testData_dirichlet_sq_sin_Burgers_512_Low.npy',ckpt_dir= 'ckpts/report/dirichlet_train_sq_sin/')
-
+    #TrainEntropyStableScheme(50, ckpt_dir= 'ckpts/report/learned_dirichlet_train_sq_sin/')#KT_superbee_trainableSPNorm_silu_NoNoise_L15_512/')
+    evaluateESS(50, 'Data/report/periodic/testData_periodic_sin_Burgers_512_Low.npy',ckpt_dir= 'ckpts/report/learned_periodic_train_sin/')
     
